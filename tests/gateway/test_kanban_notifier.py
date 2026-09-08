@@ -7,6 +7,7 @@ from gateway.config import Platform
 from gateway.kanban_watchers import (
     _acquire_singleton_lock,
     _release_singleton_lock,
+    format_block_loop_triage_notification,
 )
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
@@ -575,6 +576,24 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     assert tid_good in adapter.sent[0]["text"]
 
 
+def test_format_block_loop_triage_notification_is_deterministic():
+    assert format_block_loop_triage_notification(
+        board_tag="[demo] ",
+        tag="",
+        task_id="task-7",
+        title="Fix release",
+        reason="missing approval",
+        recurrences=3,
+    ) == (
+        "🛑 [demo] Kanban task-7 routed to TRIAGE — Fix release\n"
+        "Blocker: missing approval (blocked 3x for the same cause)\n"
+        "Choose an action:\n"
+        "1. Approve / unblock\n"
+        "2. Reject / rework\n"
+        "3. Keep blocked"
+    )
+
+
 def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
     """A `block_loop_detected` event must reach the subscriber as a triage ping.
 
@@ -611,7 +630,11 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     text = adapter.sent[0]["text"]
     assert "TRIAGE" in text
     assert tid in text
-    assert "needs credentials" in text
+    assert "loops forever" in text
+    assert "Blocker: needs credentials" in text
+    assert "1. Approve / unblock" in text
+    assert "2. Reject / rework" in text
+    assert "3. Keep blocked" in text
     # Cursor advanced: the event is claimed and not re-delivered.
     conn = kb.connect()
     try:

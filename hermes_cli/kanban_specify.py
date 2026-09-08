@@ -239,6 +239,7 @@ def specify_task(
             title=new_title,
             body=new_body,
             author=author or _profile_author(),
+            explicit_action=True,
         )
     if not ok:
         # Race: someone else promoted / archived the task between our

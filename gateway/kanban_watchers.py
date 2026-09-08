@@ -49,6 +49,33 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
     return reason
 
 
+def format_block_loop_triage_notification(
+    *,
+    board_tag: str,
+    tag: str,
+    task_id: str,
+    title: Any,
+    reason: Any,
+    recurrences: Any = None,
+) -> str:
+    """Format deterministic triage instructions for a repeated block."""
+    safe_title = _safe_review_reason(title, 120) or "(untitled)"
+    safe_reason = _safe_review_reason(reason, 160) or "unspecified blocker"
+    recurrence_text = (
+        f" (blocked {recurrences}x for the same cause)"
+        if recurrences
+        else ""
+    )
+    return (
+        f"🛑 {board_tag}{tag}Kanban {task_id} routed to TRIAGE — {safe_title}\n"
+        f"Blocker: {safe_reason}{recurrence_text}\n"
+        "Choose an action:\n"
+        "1. Approve / unblock\n"
+        "2. Reject / rework\n"
+        "3. Keep blocked"
+    )
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -682,11 +709,15 @@ class GatewayKanbanWatchersMixin:
                                 if ev.payload.get("reason"):
                                     reason = f": {str(ev.payload['reason'])[:160]}"
                                 recurrences = ev.payload.get("recurrences")
-                            rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
-                            msg = (
-                                f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
-                                f" — needs a human decision{rc}{reason}"
+                            msg = format_block_loop_triage_notification(
+                                board_tag=board_tag,
+                                tag=tag,
+                                task_id=sub["task_id"],
+                                title=title,
+                                reason=(ev.payload or {}).get("reason"),
+                                recurrences=recurrences,
                             )
+
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't

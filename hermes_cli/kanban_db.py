@@ -7205,6 +7205,7 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    explicit_action: bool = False,
 ) -> bool:
     """Flesh out a triage task and promote it to ``todo``.
 
@@ -7221,9 +7222,15 @@ def specify_triage_task(
     ``author`` is recorded on an audit comment only when at least one of
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
     comment spam for status-only promotions.
+
+    ``explicit_action`` is required for triage promotion. Background sweeps
+    must not turn a triage escalation into dispatchable work without a human
+    decision.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
+    if not explicit_action:
+        return False
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
@@ -7296,6 +7303,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    explicit_action: bool = False,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -7323,7 +7331,7 @@ def decompose_triage_task(
     the inserts so a malformed entry aborts the whole decomposition
     cleanly (no orphan children).
     """
-    if not children:
+    if not children or not explicit_action:
         return None
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
