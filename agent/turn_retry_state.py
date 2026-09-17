@@ -40,6 +40,8 @@ class TurnRetryState:
     has_retried_429: bool = False
     # Persistent 401/403 already escalated to the fallback chain once this attempt.
     auth_failover_attempted: bool = False
+    # Admission-busy recovery (bounded retry with context compaction)
+    admission_busy_recovery_attempted: bool = False
 
     # Restart signals (read by the outer loop after the attempt)
     restart_with_compressed_messages: bool = False

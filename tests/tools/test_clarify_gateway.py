@@ -399,6 +399,17 @@ class TestNativeRejectClassification:
             "sk-ms3", "just checking the visual UI, no need to pass any data",
         ) == cm.TEXT_REJECTED_PROSE
 
+    def test_human_decision_rejects_text_until_custom_mode_then_preserves_verbatim(self):
+        from tools import clarify_gateway as cm
+
+        entry = cm.register_human_decision("hd-reject", "sk-hd", "Proceed?")
+        response = "  custom answer  \\n"
+        assert cm.attempt_text_response_for_session("sk-hd", response) == cm.TEXT_REJECTED_PROSE
+        assert not entry.event.is_set()
+        assert cm.mark_human_decision_awaiting_text("hd-reject") is True
+        assert cm.attempt_text_response_for_session("sk-hd", response) == cm.TEXT_RESOLVED
+        assert cm.wait_for_human_decision("hd-reject", timeout=1) == response
+
     def test_single_select_out_of_range_is_invalid_selection(self):
         from tools import clarify_gateway as cm
 

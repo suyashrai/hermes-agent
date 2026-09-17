@@ -44,6 +44,7 @@ class FailoverReason(enum.Enum):
     invalid_encrypted_content = "invalid_encrypted_content"  # Responses replay blob rejected — strip replay state and retry
     multimodal_tool_content_unsupported = "multimodal_tool_content_unsupported"  # Provider rejected list-type content in tool messages (e.g. Xiaomi MiMo) — downgrade to text and retry
     reasoning_mandatory = "reasoning_mandatory"  # Route rejects reasoning: {enabled: false} — send the disable no more this session and retry
+    admission_busy = "admission_busy"  # Provider admission control rejecting (429/503 + admission/busy) — bounded retry with compaction
 
     # Provider-specific
     thinking_signature = "thinking_signature"  # Anthropic thinking block sig invalid
@@ -127,6 +128,13 @@ _OVERLOADED_PATTERNS = (
     "service may be temporarily overloaded", "server is overloaded", "server overloaded",
     "service overloaded", "service is overloaded", "upstream overloaded", "currently overloaded",
     "at capacity", "over capacity",
+)
+
+# Admission-control busy signals (429/503 + admission/busy wording). Distinct
+# from overloaded: the provider is deliberately shedding load, not degraded.
+# Recovery: bounded retry with context compaction (not fallback/rotation).
+_ADMISSION_BUSY_PATTERNS = (
+    "admission_busy", "chat_admission_busy", "admission-busy", "admission busy",
 )
 
 # Usage-limit patterns that need disambiguation (billing OR rate_limit), and
@@ -349,6 +357,7 @@ _V_PAYLOAD_TOO_LARGE = _v(_R.payload_too_large, should_compress=True)
 _V_OVERLOADED, _V_SERVER_ERROR, _V_TIMEOUT, _V_UNKNOWN = map(_v, (_R.overloaded, _R.server_error, _R.timeout, _R.unknown))
 _V_IMAGE_TOO_LARGE, _V_IMAGE_CORRUPT = _v(_R.image_too_large), _v(_R.image_corrupt)
 _V_MULTIMODAL, _V_INVALID_ENCRYPTED = _v(_R.multimodal_tool_content_unsupported), _v(_R.invalid_encrypted_content)
+_V_ADMISSION_BUSY = _v(_R.admission_busy)
 _V_REASONING_MANDATORY = _v(_R.reasoning_mandatory, should_compress=False, should_fallback=False)
 # A reasoning-mandatory route answering ``reasoning: {enabled: false}`` (Nous Portal + OpenRouter wording).
 _REASONING_MANDATORY_PATTERN = "reasoning is mandatory"
@@ -640,6 +649,10 @@ def _status_404(c: _Ctx) -> Verdict:
 
 
 def _status_429(c: _Ctx) -> Verdict:
+    # Admission-control busy: provider shedding load — bounded retry with
+    # context compaction, not fallback/rotation.
+    if any(p in c.msg for p in _ADMISSION_BUSY_PATTERNS):
+        return _V_ADMISSION_BUSY
     # Z.AI/Zhipu reuse 429 for server-wide overload: back off on the same
     # key instead of burning the pool (#14038).
     if any(p in c.msg for p in _OVERLOADED_PATTERNS):
@@ -669,6 +682,13 @@ def _status_5xx(c: _Ctx) -> Verdict:
     if validation and not _is_server_injected_param_rejection(c.msg, c.provider_slug):
         return _V_FORMAT_ERROR
     return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_SERVER_ERROR
+
+
+def _status_503(c: _Ctx) -> Verdict:
+    """503 Service Unavailable — admission-control busy first, then overflow/overloaded."""
+    if any(p in c.msg for p in _ADMISSION_BUSY_PATTERNS):
+        return _V_ADMISSION_BUSY
+    return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED
 
 
 def _classify_402(error_msg: str, result_fn: Callable[..., Any]) -> Any:
@@ -733,7 +753,7 @@ _STATUS_HANDLERS: Dict[int, Callable[[_Ctx], Verdict]] = {
     400: _classify_400, 401: lambda c: _V_AUTH_ROTATE, 402: lambda c: _classify_402(c.msg, dict),
     403: _status_403, 404: _status_404, 408: lambda c: _V_TIMEOUT, 413: lambda c: _V_PAYLOAD_TOO_LARGE,
     429: _status_429, 500: _status_5xx, 502: _status_5xx,
-    503: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
+    503: _status_503,
     529: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
 }
 

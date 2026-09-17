@@ -152,6 +152,8 @@ class _Collector:
         self.gc_retention_days = gc_retention_days
         self.deliveries: list[dict] = []
         self.include_unowned = runner._owns_kanban_dispatcher_lock()
+        self.reconciled_blocked_pins = getattr(runner, "_kanban_reconciled_blocked_pins", set())
+        runner._kanban_reconciled_blocked_pins = self.reconciled_blocked_pins
         self.profile_adapters = getattr(runner, "_profile_adapters", {})
         self.notifier_profiles = {notifier_profile}
         self.notifier_profiles.update(str(p).strip() for p in self.profile_adapters if str(p).strip())
@@ -235,6 +237,37 @@ class _Collector:
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
         return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+
+    def _blocked_pin_reconciliation(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:
+        metadata = sub.get("delivery_metadata") or {}
+        if not metadata.get("blocked_message_id"):
+            return None
+        task = self.kb.get_task(conn, sub["task_id"])
+        if task is None or task.status != "blocked":
+            return None
+        key = (slug, sub["task_id"], sub["platform"], sub["chat_id"], sub.get("thread_id") or "", str(metadata["blocked_message_id"]))
+        if key in self.reconciled_blocked_pins:
+            return None
+        platform_name = (sub.get("platform") or "").lower()
+        try:
+            from gateway.config import Platform
+            platform = Platform(platform_name)
+        except ValueError:
+            return None
+        if _adapter_for_subscription(
+            self.runner, platform, sub, sub.get("notifier_profile") or self.notifier_profile,
+        ) is None:
+            return None
+        return {
+            "sub": sub,
+            "old_cursor": sub.get("last_event_id", 0),
+            "cursor": sub.get("last_event_id", 0),
+            "events": [],
+            "task": task,
+            "board": slug,
+            "reconcile_blocked_pin": True,
+            "blocked_pin_key": key,
+        }
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -522,7 +555,7 @@ class _KanbanNotification:
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source)
         self._log_woke()
 
-    async def _send_event(self, ev: Any, msg: str) -> None:
+    async def _send_event(self, ev: Any, msg: str) -> Optional[str]:
         """Send one text ping; raises on adapter exception or SendResult(success=False)."""
         sub, adapter = self.sub, self.adapter
         delivery_metadata = sub.get("delivery_metadata")
@@ -547,10 +580,55 @@ class _KanbanNotification:
                 )
             except Exception as art_exc:
                 logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
+        return str(getattr(_send_res, "message_id", "")) or None
+
+    async def _handle_blocked_pin(self, ev: Any, message_id: Optional[str]) -> None:
+        """Pin a newly delivered blocker and persist its message id."""
+        if not message_id or self.sub.get("delivery_metadata", {}).get("blocked_message_id"):
+            return
+        metadata = dict(self.sub.get("delivery_metadata") or {})
+        try:
+            pinned = await self.adapter.pin_message(self.sub["chat_id"], message_id, metadata=metadata)
+        except Exception as exc:
+            logger.warning("kanban notifier: failed to pin blocked message for %s: %s", self.task_id, exc)
+            return
+        if not pinned:
+            logger.warning("kanban notifier: failed to pin blocked message for %s", self.task_id)
+            return
+        await _to_thread_process_service(partial(
+            self.runner._kanban_sub_op, self.board_slug, "set_blocked_notify_message", self.sub,
+            message_id=message_id,
+        ))
+        self.sub.setdefault("delivery_metadata", {})["blocked_message_id"] = str(message_id)
+
+    async def _handle_status_unpin(self, ev: Any) -> None:
+        """Unpin and clear a persisted blocker when work resumes."""
+        status = str(_payload(ev, "status") or "").lower()
+        if status not in {"ready", "running", "done"}:
+            return
+        message_id = (self.sub.get("delivery_metadata") or {}).get("blocked_message_id")
+        if not message_id:
+            return
+        metadata = dict(self.sub.get("delivery_metadata") or {})
+        metadata.pop("blocked_message_id", None)
+        try:
+            unpinned = await self.adapter.unpin_message(self.sub["chat_id"], str(message_id), metadata=metadata)
+        except Exception as exc:
+            logger.warning("kanban notifier: failed to unpin blocked message for %s: %s", self.task_id, exc)
+            return
+        if not unpinned:
+            logger.warning("kanban notifier: failed to unpin blocked message for %s", self.task_id)
+            return
+        await _to_thread_process_service(partial(
+            self.runner._kanban_sub_op, self.board_slug, "clear_blocked_notify_message", self.sub,
+        ))
+        self.sub.get("delivery_metadata", {}).pop("blocked_message_id", None)
 
     async def _send_pings(self) -> bool:
         """Send every text ping; False when a send failed (claim already rewound/dropped)."""
         for ev in self.d["events"]:
+            if ev.kind == "status":
+                await self._handle_status_unpin(ev)
             msg = self.format_event(ev)
             if msg is None:
                 continue
@@ -570,7 +648,9 @@ class _KanbanNotification:
             if ev.id <= self.sub.get("last_ping_event_id", 0):
                 continue
             try:
-                await self._send_event(ev, msg)
+                message_id = await self._send_event(ev, msg)
+                if ev.kind == "blocked":
+                    await self._handle_blocked_pin(ev, message_id)
                 await _to_thread_process_service(partial(
                     self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
                     event_id=ev.id,

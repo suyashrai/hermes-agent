@@ -1364,6 +1364,13 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+            # Board-owner routing runs after the task transaction commits, before
+            # create_task returns and dispatch can claim it.
+            try:
+                from hermes_cli.kanban_db_notify import add_assignee_topic_sub
+                add_assignee_topic_sub(conn, task_id=task_id, assignee=assignee)
+            except Exception as exc:  # never make task creation fail on routing
+                _log.warning("assignee topic subscription failed for %s: %s", task_id, exc)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

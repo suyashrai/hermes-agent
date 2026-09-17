@@ -517,6 +517,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._approval_state: Dict[int, str] = {}  # message_id → session_key
         self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: Dict[str, str] = {}  # clarify_id → session_key
+        self._human_decision_state: Dict[str, Dict[str, Optional[str]]] = {}
         # "important" (default): only final responses, approvals and slash confirmations notify;
         # "all": every message notifies (display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
@@ -3852,6 +3853,37 @@ class TelegramAdapter(BasePlatformAdapter):
         return await self._send_prompt(
             "send_clarify", chat_id, metadata, build, parse_mode=ParseMode.HTML, thread_id=self._metadata_thread_id(metadata))
 
+    async def send_human_decision(
+        self, chat_id: str, question: str, decision_id: str, session_key: str,
+        metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """Send process-local decision prompt; restart loses pending state and callbacks fail closed."""
+        def build():
+            text = f"❓ {_html.escape(question)}"
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Yes", callback_data=f"hd:{decision_id}:yes"),
+                InlineKeyboardButton("No", callback_data=f"hd:{decision_id}:no"),
+                InlineKeyboardButton("Custom text", callback_data=f"hd:{decision_id}:custom"),
+            ]])
+            def remember(msg):
+                self._human_decision_state[decision_id] = {
+                    "session_key": session_key,
+                    "chat_id": str(chat_id),
+                    "thread_id": self._metadata_thread_id(metadata),
+                    "message_id": str(msg.message_id),
+                    "prompt_text": text,
+                }
+                try:
+                    from tools.clarify_gateway import register_cleanup_callback
+                    register_cleanup_callback(session_key, lambda: self.clear_human_decision_state(decision_id))
+                    from tools.clarify_gateway import register_resolution_callback
+                    register_resolution_callback(decision_id, lambda entry: self._on_human_decision_resolved(entry))
+                except Exception:
+                    logger.debug("[%s] human decision cleanup registration failed", self.name, exc_info=True)
+            return text, keyboard, remember
+        return await self._send_prompt(
+            "send_human_decision", chat_id, metadata, build, parse_mode=ParseMode.HTML,
+            thread_id=self._metadata_thread_id(metadata))
+
     @staticmethod
     def _provider_get_label():
         try:
@@ -4256,19 +4288,48 @@ class TelegramAdapter(BasePlatformAdapter):
         for prefix, handler in (
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
+            ("hd:", self._handle_human_decision_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
             if data.startswith(prefix):
                 await handler(query, data, cb)
                 return
 
     async def _claim_callback_state(self, query, cb: Dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
-        """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""
+        """Auth-gate button tap, validate originating chat/thread, then claim pending state."""
         if not await self._callback_authorized(query, cb, denial):
             return None
-        session_key = state.pop(key, None) if pop else state.get(key)
+        value = state.get(key)
+        if isinstance(value, dict):
+            session_key = value.get("session_key")
+            expected_chat = value.get("chat_id")
+            expected_thread = value.get("thread_id")
+            actual_chat = str(cb.get("chat_id") or "")
+            actual_thread = cb.get("thread_id")
+            if (
+                not session_key
+                or str(expected_chat or "") != actual_chat
+                or (str(expected_thread) if expected_thread is not None else None)
+                != (str(actual_thread) if actual_thread is not None else None)
+            ):
+                await query.answer(text="This prompt does not belong to this chat or thread.")
+                return None
+        else:
+            session_key = value
         if not session_key:
             await query.answer(text=resolved)
+            return None
+        if pop:
+            state.pop(key, None)
         return session_key
+
+    def clear_human_decision_state(self, decision_id: Optional[str] = None) -> None:
+        if decision_id is None:
+            self._human_decision_state.clear()
+        else:
+            self._human_decision_state.pop(decision_id, None)
+
+    def _on_human_decision_resolved(self, entry) -> None:
+        self._human_decision_state.pop(entry.clarify_id, None)
 
     async def _handle_exec_approval_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """``ea:<choice>:<approval_id>`` — resolve a pending exec approval."""
@@ -4425,6 +4486,51 @@ class TelegramAdapter(BasePlatformAdapter):
             # Entry evicted / gateway restarted between ask and tap.
             await self._notify_clarify_expired(query, user_display)
             logger.warning("Telegram clarify button: resolve_gateway_clarify returned False (id=%s)", clarify_id)
+
+    async def _handle_human_decision_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
+        """``hd:<id>:yes|no|custom`` — resolve a process-local human decision."""
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[2] not in {"yes", "no", "custom"}:
+            await query.answer(text="Invalid decision data.")
+            return
+        decision_id, choice = parts[1], parts[2]
+        session_key = await self._claim_callback_state(
+            query, cb, self._human_decision_state, decision_id,
+            "⛔ You are not authorized to answer this prompt.",
+            "This prompt has already been resolved.", pop=False)
+        if not session_key:
+            return
+        user_display = getattr(query.from_user, "first_name", "User")
+        if choice == "custom":
+            try:
+                from tools.clarify_gateway import mark_human_decision_awaiting_text
+                flipped = mark_human_decision_awaiting_text(decision_id)
+            except Exception as exc:
+                logger.warning("[%s] mark human decision text failed: %s", self.name, exc)
+                flipped = False
+            if not flipped:
+                self._human_decision_state.pop(decision_id, None)
+                await self._notify_clarify_expired(query, user_display)
+                return
+            await query.answer(text="Type your custom response in the chat.")
+            await query.edit_message_text(
+                text=f"❓ {_html.escape(query.message.text or '')}\n\n<i>Awaiting custom response from {_html.escape(user_display)}…</i>",
+                parse_mode=ParseMode.HTML, reply_markup=None)
+            return
+        self._human_decision_state.pop(decision_id, None)
+        try:
+            from tools.clarify_gateway import resolve_human_decision
+            resolved = resolve_human_decision(decision_id, choice)
+        except Exception as exc:
+            logger.error("[%s] resolve human decision failed: %s", self.name, exc)
+            resolved = False
+        if resolved:
+            label = "Yes" if choice == "yes" else "No"
+            await query.answer(text=label)
+            await self._edit_html_quiet(
+                query, f"❓ {_html.escape(query.message.text or '')}\n\n<b>{_html.escape(user_display)}:</b> {label}")
+        else:
+            await self._notify_clarify_expired(query, user_display)
 
     async def _handle_update_prompt_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """``update_prompt:<y|n>`` — forward the answer to the update process."""
@@ -4858,6 +4964,37 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         self._telegram_typing_cooldown_until.pop(str(chat_id), None)
         return False
+
+    async def pin_message(
+        self, chat_id: str, message_id: str, metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if not self._bot:
+            return False
+        kwargs: Dict[str, Any] = {
+            "chat_id": normalize_telegram_chat_id(chat_id),
+            "message_id": int(message_id),
+            "disable_notification": True,
+        }
+        try:
+            await self._bot.pin_chat_message(**kwargs)
+            return True
+        except Exception as exc:
+            logger.warning("[%s] Failed to pin Telegram message %s: %s", self.name, message_id, _redact_telegram_error_text(exc))
+            return False
+
+    async def unpin_message(
+        self, chat_id: str, message_id: str, metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if not self._bot:
+            return False
+        try:
+            await self._bot.unpin_chat_message(
+                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id),
+            )
+            return True
+        except Exception as exc:
+            logger.warning("[%s] Failed to unpin Telegram message %s: %s", self.name, message_id, _redact_telegram_error_text(exc))
+            return False
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""

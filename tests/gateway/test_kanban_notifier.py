@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
+import pytest
 
 from gateway.config import Platform
 from gateway.kanban_watchers_common import (
@@ -18,9 +19,21 @@ class RecordingAdapter:
     def __init__(self):
         self.sent = []
         self.handled = []
+        self.pinned = []
+        self.unpinned = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        from gateway.platforms.base import SendResult
+        return SendResult(success=True, message_id=str(len(self.sent)))
+
+    async def pin_message(self, chat_id, message_id, metadata=None):
+        self.pinned.append((chat_id, message_id, metadata or {}))
+        return True
+
+    async def unpin_message(self, chat_id, message_id, metadata=None):
+        self.unpinned.append((chat_id, message_id, metadata or {}))
+        return True
 
     async def handle_message(self, event):
         self.handled.append(event)
@@ -82,6 +95,160 @@ def _unseen_terminal_events(tid):
         return events
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("status", ["ready", "running", "done"])
+def test_kanban_notifier_pins_blocked_message_and_unpins_on_status(
+    status, tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "blocked-pin.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="blocked pin", assignee="worker")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1", thread_id="topic-7",
+            delivery_metadata={"thread_id": "topic-7"},
+        )
+        kb.block_task(conn, tid, reason="waiting")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.pinned == [("chat-1", "1", {"thread_id": "topic-7"})]
+    conn = kbc.connect()
+    try:
+        assert kbn.get_blocked_notify_message(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1", thread_id="topic-7",
+        ) == "1"
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+            kb._append_event(conn, tid, "status", {"status": status})
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.unpinned == [("chat-1", "1", {"thread_id": "topic-7"})]
+    conn = kbc.connect()
+    try:
+        assert kbn.get_blocked_notify_message(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1", thread_id="topic-7",
+        ) is None
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.pinned) == 1
+    assert len(adapter.unpinned) == 1
+
+
+def test_kanban_notifier_reconciles_persisted_blocked_pin_without_sending(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "blocked-pin-reconcile.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="blocked pin restart", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.block_task(conn, tid, reason="waiting")
+        cursor, _events = kbn.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1", kinds=["blocked"],
+        )
+        kbn.advance_notify_cursor(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1", new_cursor=cursor,
+        )
+        kbn.set_blocked_notify_message(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1", message_id="42",
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.sent == []
+    assert adapter.pinned == [("chat-1", "42", {})]
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.pinned == [("chat-1", "42", {})]
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.sent == []
+    assert adapter.pinned == [("chat-1", "42", {}), ("chat-1", "42", {})]
+
+
+def test_kanban_notifier_skips_duplicate_blocked_message_when_mapping_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "blocked-pin-idempotent.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="blocked pin duplicate", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.block_task(conn, tid, reason="waiting")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert len(adapter.pinned) == 1
+
+    conn = kbc.connect()
+    try:
+        kb._append_event(conn, tid, "blocked", {"reason": "still waiting"})
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert len(adapter.pinned) == 1
+
+
+def test_kanban_notifier_logs_pin_and_unpin_failures(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "blocked-pin-failures.db"))
+    kb.init_db()
+
+    class FailingPinAdapter(RecordingAdapter):
+        async def pin_message(self, chat_id, message_id, metadata=None):
+            raise RuntimeError("pin failed")
+
+        async def unpin_message(self, chat_id, message_id, metadata=None):
+            raise RuntimeError("unpin failed")
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="blocked pin failures", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.block_task(conn, tid, reason="waiting")
+    finally:
+        conn.close()
+
+    adapter = FailingPinAdapter()
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert "failed to pin blocked message" in caplog.text
+
+    conn = kbc.connect()
+    try:
+        assert kbn.get_blocked_notify_message(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        ) is None
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+            kb._append_event(conn, tid, "status", {"status": "ready"})
+        kbn.set_blocked_notify_message(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1", message_id="99",
+        )
+    finally:
+        conn.close()
+
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert "failed to unpin blocked message" in caplog.text
 
 
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):

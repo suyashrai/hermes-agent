@@ -37,6 +37,43 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert subs[0]["notifier_profile"] == "default"
 
 
+def test_assignee_topic_subscription_is_idempotent_and_preserves_origin(kanban_home):
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="assigned routing", assignee="ada")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="origin",
+            thread_id="1", chat_type="dm", notifier_profile="veyra",
+            delivery_mode="notify+wake",
+        )
+        assert kbn.add_assignee_topic_sub(conn, task_id=tid, assignee="ada") is True
+        assert kbn.add_assignee_topic_sub(conn, task_id=tid, assignee="ada") is True
+        rows = kbn.list_notify_subs(conn, tid)
+        assert len(rows) == 2
+        assert {(r["chat_id"], r["thread_id"], r["notifier_profile"]) for r in rows} == {
+            ("origin", "1", "veyra"), ("-1003893757415", "6", "ada")
+        }
+        assert kbn.add_assignee_topic_sub(conn, task_id=tid, assignee="unknown") is False
+    finally:
+        conn.close()
+
+
+def test_blocked_state_pin_metadata_is_durable_and_cleared_on_unblock(kanban_home):
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="blocked pin", assignee="ada")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kbn.set_blocked_notify_message(conn, task_id=tid, platform="telegram", chat_id="chat1", message_id="42")
+        rows = kbn.list_notify_subs(conn, tid)
+        row = next(row for row in rows if row["chat_id"] == "chat1")
+        assert row["delivery_metadata"]["blocked_message_id"] == "42"
+        assert kbn.get_blocked_notify_message(conn, task_id=tid, platform="telegram", chat_id="chat1") == "42"
+        kbn.clear_blocked_notify_message(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        assert kbn.get_blocked_notify_message(conn, task_id=tid, platform="telegram", chat_id="chat1") is None
+    finally:
+        conn.close()
+
+
 def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
     """delivery_mode persists; an explicit re-subscribe is last-write-wins, a
     ``None`` re-subscribe leaves the existing mode untouched, an unknown value

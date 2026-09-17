@@ -31,6 +31,38 @@ _SCALAR_TYPES = (str, int, float, bool)
 # ``(task_id, platform, chat_id, thread_id or "")`` against it.
 _SUB_KEY_WHERE = "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?"
 
+# Board-owner routing for assigned workers. Keep this explicit and narrow: the
+# subscription is an event-driven wake path, not a broadcast or scheduler.
+_ASSIGNEE_TOPIC_TARGETS = {
+    "ada": ("6", "ada"),
+    "muse-aved": ("5", "muse-aved"),
+    "max-aved": ("4", "max-aved"),
+    "sage-aved": ("4", "sage-aved"),
+    "veyra": ("1", "veyra"),
+    "founder": ("1", "veyra"),
+}
+
+
+def add_assignee_topic_sub(conn: sqlite3.Connection, *, task_id: str,
+                           assignee: Optional[str]) -> bool:
+    """Idempotently subscribe an assigned profile to its Telegram forum topic.
+
+    This is intentionally a board-owner helper: unknown profiles are a no-op,
+    while failures are isolated from task creation. The existing subscription
+    key preserves any originating Veyra subscription as a separate destination.
+    """
+    target = _ASSIGNEE_TOPIC_TARGETS.get(str(assignee or "").strip().lower())
+    if target is None:
+        return False
+    thread_id, notifier_profile = target
+    add_notify_sub(
+        conn, task_id=task_id, platform="telegram",
+        chat_id="-1003893757415", thread_id=thread_id,
+        chat_type="group", notifier_profile=notifier_profile,
+        delivery_mode="notify+wake",
+    )
+    return True
+
 
 def _sub_key(task_id: str, platform: str, chat_id: str, thread_id: Optional[str]) -> tuple:
     return (task_id, platform, chat_id, thread_id or "")
@@ -127,6 +159,63 @@ def add_notify_sub(
                 f"UPDATE kanban_notify_subs SET {column} = ? " + _SUB_KEY_WHERE + guard,
                 (value, *key),
             )
+
+
+def set_blocked_notify_message(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None, message_id: str,
+) -> bool:
+    message_id = str(message_id).strip()
+    if not message_id:
+        return False
+    key = _sub_key(task_id, platform, chat_id, thread_id)
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE, key,
+        ).fetchone()
+        if row is None:
+            return False
+        metadata = _decode_notify_delivery_metadata(row["delivery_metadata"])
+        metadata["blocked_message_id"] = message_id
+        conn.execute(
+            "UPDATE kanban_notify_subs SET delivery_metadata = ? " + _SUB_KEY_WHERE,
+            (_encode_notify_delivery_metadata(metadata), *key),
+        )
+    return True
+
+
+def get_blocked_notify_message(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None,
+) -> Optional[str]:
+    row = conn.execute(
+        "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+        _sub_key(task_id, platform, chat_id, thread_id),
+    ).fetchone()
+    if row is None:
+        return None
+    value = _decode_notify_delivery_metadata(row["delivery_metadata"]).get("blocked_message_id")
+    return str(value) if value not in (None, "") else None
+
+
+def clear_blocked_notify_message(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    key = _sub_key(task_id, platform, chat_id, thread_id)
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE, key,
+        ).fetchone()
+        if row is None:
+            return False
+        metadata = _decode_notify_delivery_metadata(row["delivery_metadata"])
+        metadata.pop("blocked_message_id", None)
+        conn.execute(
+            "UPDATE kanban_notify_subs SET delivery_metadata = ? " + _SUB_KEY_WHERE,
+            (_encode_notify_delivery_metadata(metadata), *key),
+        )
+    return True
 
 
 def _notify_profile_filter(
