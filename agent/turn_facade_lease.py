@@ -184,6 +184,7 @@ class DurableTurnLease:
             if self.db.refresh_session_turn_lease(
                 self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS
             ):
+                self._failed_refreshes = 0
                 return None
             if self.stop.is_set():
                 return False
@@ -194,9 +195,14 @@ class DurableTurnLease:
         except Exception:
             if self.stop.is_set():
                 return False
+            self._failed_refreshes = getattr(self, "_failed_refreshes", 0) + 1
             logger.warning(
-                "Failed to refresh session turn lease: %s", self._current_session_id(), exc_info=True,
+                "Failed to refresh session turn lease (%d/3): %s",
+                self._failed_refreshes, self._current_session_id(), exc_info=True,
             )
+            # shortcut: retry up to 3 times before interrupting when lease TTL (300s) exceeds interval (60s)
+            if self._failed_refreshes < 3:
+                return None
             self._interrupt_turn(
                 "Session turn lease could not be refreshed; stopping to protect the transcript."
             )

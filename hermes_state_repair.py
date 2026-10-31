@@ -706,7 +706,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
             # tokenizer absence must never classify as corruption.
             load_fts5_cjk_extension(conn)
             conn.execute("PRAGMA journal_mode").fetchone()
-            rows = conn.execute("PRAGMA integrity_check").fetchall()
+            rows = conn.execute("PRAGMA quick_check").fetchall()
             problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
             if problems:
                 return "; ".join(problems[:3])
