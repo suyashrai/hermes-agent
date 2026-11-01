@@ -408,6 +408,14 @@ def _rewrite_delegate_task(td: Dict[str, Any], available: set) -> Optional[Dict[
     return {**td, "function": {**fn, "description": desc}}
 
 
+def _rewrite_clarify(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
+    """Clarify requires an interactive terminal/chat user. In headless Kanban tasks,
+    drop the tool completely so workers cannot stall or prompt."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    return td
+
+
 _DYNAMIC_SCHEMA_REWRITERS = {
     "execute_code": _rewrite_execute_code,
     "discord": _discord_rewriter("get_dynamic_schema_core"),
@@ -415,6 +423,7 @@ _DYNAMIC_SCHEMA_REWRITERS = {
     "browser_navigate": _rewrite_browser_navigate,
     "browser_exec": _rewrite_browser_exec,
     "delegate_task": _rewrite_delegate_task,
+    "clarify": _rewrite_clarify,
 }
 
 

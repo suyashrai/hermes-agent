@@ -4,6 +4,7 @@ callback (cli.py, gateway/run.py, tui_gateway)."""
 
 import inspect
 import json
+import os
 from typing import Dict, List, Optional, Callable
 
 MAX_CHOICES = 4  # the UI always appends an "Other (type your answer)" row
@@ -196,6 +197,8 @@ def clarify_tool(question: str, choices: Optional[List[str]] = None, multi_selec
     normalized list in one call; platforms without it are looped one question at a time. Injected by the
     agent runner (cli.py / gateway).
     """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return tool_error("clarify is disabled in headless Kanban tasks. Use kanban_comment and kanban_block(reason=...) instead.")
     if questions is not None:
         normalized, error = _normalize_questions(questions)
         if error:
@@ -231,7 +234,9 @@ def clarify_tool(question: str, choices: Optional[List[str]] = None, multi_selec
 
 
 def check_clarify_requirements() -> bool:
-    """Clarify tool has no external requirements -- always available."""
+    """Clarify tool requires an interactive user -- disabled for headless Kanban tasks."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return False
     return True
 
 
